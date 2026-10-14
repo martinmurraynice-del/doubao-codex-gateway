@@ -1,0 +1,7 @@
+{
+  "port": 18593,
+  "codexBin": "codex",
+  "allowedRoots": ["/absolute/path/to/your/projects"],
+  "maxConcurrent": 1,
+  "model": null
+}

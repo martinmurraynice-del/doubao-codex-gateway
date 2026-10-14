@@ -1,0 +1,21 @@
+{
+  "name": "doubao-codex-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent local MCP task gateway from Doubao Work to Codex app-server",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "https://github.com/martinmurraynice-del/doubao-codex-gateway.git"},
+  "homepage": "https://github.com/martinmurraynice-del/doubao-codex-gateway#readme",
+  "bugs": {"url": "https://github.com/martinmurraynice-del/doubao-codex-gateway/issues"},
+  "engines": {"node": ">=24.0.0"},
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "mcp": "node src/mcp.mjs",
+    "test": "node --test test/*.test.mjs",
+    "doctor": "node src/cli.mjs doctor",
+    "skill:pack": "node scripts/pack-skill.mjs",
+    "release:check": "node scripts/check-release.mjs"
+  },
+  "dependencies": {"@modelcontextprotocol/sdk": "^1.21.0", "zod": "^3.25.76"}
+}
