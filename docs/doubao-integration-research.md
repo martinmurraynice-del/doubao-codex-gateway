@@ -1,6 +1,6 @@
 # 豆包工作原生接入
 
-本项目使用豆包工作的原生自定义 STDIO 连接器与 Skill 上传功能。已在 macOS 的豆包工作 2.32.3 中完成实际工具调用和任务验收；其他版本的菜单文字、账号开关和本地运行时状态可能不同。
+本项目使用豆包工作的原生自定义 STDIO 连接器与 Skill 上传功能。已在 macOS 的豆包工作中完成实际工具调用和任务验收，最近一次 Skill 上传与详情核验使用 2.32.3；其他版本的菜单文字、账号开关和本地运行时状态可能不同。
 
 ## 注册连接器
 
@@ -16,7 +16,9 @@ node src/cli.mjs connector-config
 
 保存后确认连接器可用、工具列表出现，并在实际工作对话中调用 `codex_health`。项目的内部 HTTP `/rpc` 不是 Streamable HTTP MCP 地址，接入时应选择 STDIO。
 
-安装后脚本位于 Application Support 的版本化部署目录。`connector-config` 通过 `installation.json` 找到正确路径。重装网关会产生新路径，应重新生成并更新连接器参数。
+安装后的运行代码位于 Application Support 的版本化部署目录，连接器使用固定的 `bin/mcp.mjs` 启动器，启动时通过 `installation.json` 选择当前部署。旧连接器直接指向带时间戳的脚本时，按 `connector-config` 输出迁移一次；后续升级通常只需重连 MCP 并刷新工具列表，不随部署时间戳改参数。Node 路径或状态目录改变时仍需重新核对配置。
+
+当前工作树新增 `codex_collect_images`。安装版仍缺少此工具时，需要更新运行版本并刷新连接器工具列表，源码中的 14 工具文档不能证明已有连接器已更新。Skill 也应上传相应版本；在真正调用成功前，不声称已经收集图片。
 
 ## 上传 Skill
 
@@ -25,7 +27,9 @@ node src/cli.mjs connector-config
 - [Skill 源码](../skills/doubao-codex-executor/SKILL.md)
 - [最新 Release 的 ZIP](https://github.com/martinmurraynice-del/doubao-codex-gateway/releases/latest/download/doubao-codex-executor.zip)
 
-选择“上传技能”，等待应用检查完成，在管理界面确认 `Doubao Codex Executor` 可用。连接器和 Skill 的存在本身不是端到端验证；还需让豆包调用工具并核对真实文件。
+从当前源码安装时，应在仓库根目录运行 `npm run skill:pack`，上传生成的 `dist/doubao-codex-executor.zip`，或使用同版本 Skill 源文件。Release ZIP 只对应其标签版本，源码推送不会更新已有附件。
+
+选择“上传技能”，已有同名技能时选择替换。等待应用检查完成，在管理界面重新打开 `Doubao Codex Executor` 详情，确认内容已更新且保持启用。连接器和 Skill 的存在本身不是端到端验证；还需让豆包调用工具并核对真实文件。
 
 ## 为什么不依赖第三方桌面 CLI
 

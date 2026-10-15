@@ -29,6 +29,13 @@ function readResult(result) {
   return JSON.parse(result.stdout);
 }
 
+function installedRuntime(f, name) {
+  const runtime = path.join(path.dirname(f.stateDir), 'deployments', name);
+  fs.mkdirSync(path.join(runtime, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'src', 'mcp.mjs'), '// Installed MCP fixture.\n');
+  return runtime;
+}
+
 test('init creates private, portable config and keeps model unspecified by default', (t) => {
   const f = fixture(t);
   const result = readResult(f.run(['init', '--allow-root', f.workspace]));
@@ -74,6 +81,8 @@ test('relative configuration and state environment paths become absolute diagnos
   assert.equal(paths.serviceLabel, 'io.github.doubao-codex-gateway');
   const connector = readResult(f.run(['connector-config'], relativeEnv));
   assert.equal(connector.env.GATEWAY_STATE_DIR, paths.stateDir);
+  assert.deepEqual(connector.args, [path.join(project, 'src', 'mcp.mjs')]);
+  assert.equal(paths.stableMcpReady, false);
 });
 
 test('invalid or incomplete init options never write config or state', (t) => {
@@ -123,7 +132,7 @@ test('filesystem and home roots are refused, including symlink aliases', (t) => 
 
 test('connector config honors installed runtime, Node path, and historical service label metadata', (t) => {
   const f = fixture(t);
-  const runtime = path.join(f.root, 'deployment');
+  const runtime = installedRuntime(f, 'initial');
   const skill = path.join(runtime, 'skills', 'doubao-codex-executor', 'SKILL.md');
   fs.mkdirSync(path.dirname(skill), { recursive: true });
   fs.writeFileSync(skill, 'fixture skill');
@@ -139,6 +148,8 @@ test('connector config honors installed runtime, Node path, and historical servi
   const paths = readResult(f.run(['paths']));
   assert.equal(paths.serviceLabel, 'org.example.existing-gateway');
   assert.equal(paths.runtime, runtime);
+  assert.equal(paths.stableMcpReady, false, 'Legacy installs remain usable until install adds the stable launcher');
+  assert.equal(paths.mcpLauncher, path.join(path.dirname(f.stateDir), 'bin', 'mcp.mjs'));
   if (process.platform === 'darwin') assert.ok(paths.launchAgentPlist.endsWith('org.example.existing-gateway.plist'));
   assert.equal(fs.existsSync(f.stateDir), false, 'Read-only diagnostics must not create state');
 });
@@ -146,11 +157,51 @@ test('connector config honors installed runtime, Node path, and historical servi
 test('legacy metadata without a service label uses the neutral default and source Skill fallback', (t) => {
   const f = fixture(t);
   fs.mkdirSync(path.dirname(f.stateDir), { recursive: true });
-  const runtime = path.join(f.root, 'old-deployment');
+  const runtime = installedRuntime(f, 'legacy');
   fs.writeFileSync(path.join(path.dirname(f.stateDir), 'installation.json'), JSON.stringify({ runtime, source: project }));
   const connector = readResult(f.run(['connector-config']));
   assert.equal(connector.skill, path.join(project, 'skills', 'doubao-codex-executor', 'SKILL.md'));
   assert.equal(readResult(f.run(['paths'])).serviceLabel, 'io.github.doubao-codex-gateway');
+});
+
+test('installed connector entrypoint remains stable when the manifest selects a newer deployment', (t) => {
+  const f = fixture(t);
+  const installationRoot = path.dirname(f.stateDir);
+  const launcher = path.join(installationRoot, 'bin', 'mcp.mjs');
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.copyFileSync(path.join(project, 'src', 'installed-mcp.mjs'), launcher);
+  const manifest = path.join(installationRoot, 'installation.json');
+  const first = installedRuntime(f, 'first');
+  fs.writeFileSync(manifest, JSON.stringify({ runtime: first, nodeBin: process.execPath }));
+  const oldConnector = readResult(f.run(['connector-config']));
+  assert.deepEqual(oldConnector.args, [launcher]);
+  const second = installedRuntime(f, 'second');
+  fs.writeFileSync(manifest, JSON.stringify({ runtime: second, nodeBin: process.execPath }));
+  const newConnector = readResult(f.run(['connector-config']));
+  assert.deepEqual(newConnector, oldConnector);
+  const paths = readResult(f.run(['paths']));
+  assert.equal(paths.runtime, second);
+  assert.equal(paths.mcpEntrypoint, launcher);
+  assert.equal(paths.mcpLauncher, launcher);
+  assert.equal(paths.stableMcpReady, true);
+  assert.equal(fs.existsSync(f.stateDir), false, 'Read-only diagnostics must not create state');
+});
+
+test('connector config rejects missing runtimes and deployed MCP symlinks that escape the installation', (t) => {
+  const f = fixture(t);
+  const runtime = installedRuntime(f, 'safe');
+  const manifest = path.join(path.dirname(f.stateDir), 'installation.json');
+  fs.writeFileSync(manifest, JSON.stringify({ runtime }));
+  fs.unlinkSync(path.join(runtime, 'src', 'mcp.mjs'));
+  const missing = f.run(['connector-config']);
+  assert.equal(missing.status, 1);
+  assert.equal(JSON.parse(missing.stderr).error.code, 'INSTALLATION');
+  const outside = path.join(f.root, 'outside.mjs');
+  fs.writeFileSync(outside, 'throw new Error("should never execute");');
+  fs.symlinkSync(outside, path.join(runtime, 'src', 'mcp.mjs'));
+  const escaped = f.run(['connector-config']);
+  assert.equal(escaped.status, 1);
+  assert.equal(JSON.parse(escaped.stderr).error.code, 'INSTALLATION');
 });
 
 test('malformed installation records fail instead of silently selecting a wrong runtime or service', (t) => {

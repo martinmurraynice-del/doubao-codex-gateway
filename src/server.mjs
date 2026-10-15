@@ -6,9 +6,10 @@ import { CodexClient } from './codex.mjs';
 import { Engine } from './engine.mjs';
 import { Store } from './store.mjs';
 import { GatewayError, STATE_DIR } from './config.mjs';
+import { TransportSupervisor } from './reconnect.mjs';
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const mutations = new Set(['bind_workspace', 'submit', 'rework', 'recover', 'cancel', 'accept']);
+const mutations = new Set(['bind_workspace', 'submit', 'rework', 'recover', 'cancel', 'accept', 'collect_images']);
 
 function pidExists(pid) {
   if (!Number.isInteger(pid) || pid < 1) return true;
@@ -127,8 +128,8 @@ function validateParams(method, params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) {
     throw new GatewayError('INVALID_INPUT', 'RPC params must be an object.');
   }
-  if (['get', 'wait', 'events', 'cancel', 'rework', 'recover', 'accept'].includes(method)) {
-    if (typeof params.id !== 'string' || !params.id || params.id.length > 256) {
+  if (['get', 'wait', 'events', 'cancel', 'rework', 'recover', 'accept', 'collect_images'].includes(method)) {
+    if (typeof params.id !== 'string' || !params.id.trim() || params.id.length > 256) {
       throw new GatewayError('INVALID_INPUT', 'A valid task id is required.');
     }
   }
@@ -150,7 +151,7 @@ function validateParams(method, params) {
 }
 
 /** Start one durable scheduler and its authenticated, loopback-only RPC endpoint. */
-export async function startServer({ config, stateDir = STATE_DIR, client: injectedClient, tickIntervalMs = 500 } = {}) {
+export async function startServer({ config, stateDir = STATE_DIR, client: injectedClient, tickIntervalMs = 500, reconnectOptions } = {}) {
   if (!config) throw new GatewayError('CONFIG', 'Gateway configuration is required.');
   stateDir = path.resolve(stateDir);
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -166,6 +167,7 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
   let engine;
   let server;
   let timer;
+  let reconnect;
   let url;
   let closing = false;
   let tokenWritten = false;
@@ -202,6 +204,7 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
     closing = true;
     if (engine) engine.closing = true;
     clearInterval(timer);
+    reconnect?.pause();
     closePromise = (async () => {
       let serverClosed = Promise.resolve();
       if (server?.listening) {
@@ -212,6 +215,10 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
       // stopping Codex. Pending mutations fail with SHUTTING_DOWN.
       await queue;
       await client.stop().catch(() => {});
+      // Stop cancels an initialization already in progress. Drain its promise
+      // before closing durable state, and stop again if it completed late.
+      await reconnect?.settled();
+      if (client.ready || client.child) await client.stop().catch(() => {});
       if (store) {
         for (const run of store.all().filter((run) => run.holdsCapacity)) {
           store.save({ ...run, status: 'uncertain', error: {
@@ -232,15 +239,17 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
   try {
     store = new Store(stateDir);
     engine = new Engine({ store, client, config });
+    reconnect = new TransportSupervisor({ ...reconnectOptions, client });
     await client.start();
     await engine.restore();
     const handlers = {
-      health: () => ({ ok: true, service: 'doubao-codex-gateway', codexConnected: Boolean(client.ready), pid: process.pid }),
+      health: () => ({ ok: true, service: 'doubao-codex-gateway', codexConnected: Boolean(client.ready), connection: reconnect.snapshot(), connectionScope: 'transport_only', lastProtocolError: client.lastProtocolError ?? null, pid: process.pid }),
       models: () => engine.models(),
       bind_workspace: (params) => engine.bindWorkspace(params),
       workspaces: () => store.bindings(),
       submit: (params) => engine.submit(params),
       get: ({ id }) => engine.get(id),
+      collect_images: (params) => engine.collectImages(params),
       list: ({ limit }) => engine.list(limit),
       wait: (params) => engine.wait(params),
       events: ({ id, after = 0, limit = 100 }) => {
@@ -297,7 +306,7 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
         const operation = () => handlers[envelope.method](params);
         const result = mutations.has(envelope.method) ? await serialize(operation) : await operation();
         reply(res, 200, { result: result ?? null });
-        if (mutations.has(envelope.method)) scheduleTick();
+        if (mutations.has(envelope.method) && envelope.method !== 'collect_images') scheduleTick();
       } catch (error) {
         const known = error instanceof GatewayError || typeof error.code === 'string' || typeof error.code === 'number';
         reply(res, error.code === 'BODY_TOO_LARGE' ? 413 : 400, { error: {
@@ -328,6 +337,7 @@ export async function startServer({ config, stateDir = STATE_DIR, client: inject
       try { fs.unlinkSync(tempToken); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     writePrivateJson(connectionFile, { url, tokenFile, pid: process.pid, instanceId });
+    reconnect.activate();
     timer = setInterval(scheduleTick, tickIntervalMs);
     timer.unref();
     scheduleTick();

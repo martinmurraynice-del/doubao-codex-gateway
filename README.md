@@ -15,7 +15,7 @@ flowchart LR
   B --> A
 ```
 
-提供 13 个 MCP 工具：工作区绑定、幂等提交、事件续读、等待、取消、返工、恢复和独立验收。`completed` 表示执行结束，`accepted` 表示监督者已经检查结果。
+当前工作树提供 14 个 MCP 工具：工作区绑定、幂等提交、事件续读、等待、图片原图收集、取消、返工、恢复和独立验收。`completed` 表示执行结束，`accepted` 表示监督者已经检查结果。新增工具需要安装对应网关版本并刷新豆包连接器，已有安装或 Release 不会随源码修改自动更新。
 
 已在 macOS 上验证真实豆包工作 → MCP → Codex → 文件产物 → 豆包验收链路，以及后台服务重启后同会话返工。测试范围见 [验证记录](docs/verification.md)。这不代表克隆仓库后已经完成你本机的配置。
 
@@ -66,7 +66,7 @@ node src/cli.mjs install
 node src/cli.mjs doctor
 ```
 
-不要同时启动前台服务和后台服务占用同一端口。默认监听回环地址，端口 `18593`。
+不要同时启动前台服务和后台服务占用同一端口。默认监听回环地址，端口 `18593`。安装的 LaunchAgent 使用 `RunAtLoad` 和 `KeepAlive`，在用户登录会话中启动并维持后台服务；它不是关机后仍运行的云服务。
 
 配置与数据默认位于当前用户的 `~/Library/Application Support/DoubaoCodexGateway`：
 
@@ -76,6 +76,7 @@ node src/cli.mjs doctor
 | `data/` | SQLite、连接信息、私有令牌和服务日志 |
 | `deployments/<timestamp>/` | `install` 复制的运行代码与依赖 |
 | `installation.json` | 当前安装的运行目录 |
+| `bin/mcp.mjs` | 固定 MCP 启动器，启动时读取当前安装记录 |
 
 配置字段见 [config.example.json](config.example.json)。`GATEWAY_CONFIG` 可覆盖配置文件，`GATEWAY_STATE_DIR` 可覆盖状态目录；服务与 MCP 客户端必须使用同一个状态目录。不要把运行数据或令牌提交到仓库。
 
@@ -99,7 +100,17 @@ node src/cli.mjs connector-config
 
 使用“本地电脑”运行时，等待连接成功并检查工具列表。不要将网关内部 `/rpc` 地址填成 HTTP MCP 地址。正常原生注册无需 CDP，项目不依赖 doubao-cli。
 
-下载 [最新 Release 的 Skill ZIP](https://github.com/martinmurraynice-del/doubao-codex-gateway/releases/latest/download/doubao-codex-executor.zip)，在技能中心选择“上传技能”，上传 ZIP 并等待应用检测完成。也可以上传 [Skill 源文件](skills/doubao-codex-executor/SKILL.md) 或包含它的技能文件夹。ZIP 是 Release 附件，不在源码中维护生成副本。
+完成当前版本的 `install` 后，`connector-config` 优先输出固定的 `bin/mcp.mjs` 入口。它每次启动都按 `installation.json` 选择当前部署，因此后续升级通常无需修改豆包中的脚本参数，但仍要重新连接 MCP/刷新工具列表，旧进程不会热加载新工具。旧安装直接指向 `deployments/<timestamp>/src/mcp.mjs` 时，先按新输出迁移一次；Node 路径或状态目录改变时也应重新核对配置。
+
+按本文从当前源码安装时，在仓库根目录运行：
+
+```sh
+npm run skill:pack
+```
+
+在技能中心选择“上传技能”，上传生成的 `dist/doubao-codex-executor.zip` 并等待应用检测完成；已有同名技能时选择替换。也可以上传 [Skill 源文件](skills/doubao-codex-executor/SKILL.md) 或包含它的技能文件夹。
+
+[最新 Release 的 Skill ZIP](https://github.com/martinmurraynice-del/doubao-codex-gateway/releases/latest/download/doubao-codex-executor.zip) 仅对应该 Release 的标签版本，不会随源码推送更新；安装未发布源码时不要用旧 Release 的 ZIP 代替当前包。ZIP 不在源码中维护生成副本。
 
 连接器提供工具，`Doubao Codex Executor` Skill 规定任务监督和验收方式，两者都需要启用。不同豆包版本的菜单名称或账号能力可能不同，详见 [接入说明](docs/doubao-integration-research.md)。
 
@@ -121,15 +132,31 @@ node src/cli.mjs connector-config
 
 ## 持久工作流的边界
 
+- 连接的是本机 Gateway 和持久 Codex Thread，不是当前 Codex 聊天窗口；关闭一个聊天不等于卸载后台服务。
+- Codex 传输断开后，网关以单一重连流程和指数退避尝试恢复连接；不重放任务，也不自动清除 `uncertain` 的容量占用。
 - 提交和返工都使用稳定幂等键。响应丢失先查已有任务，不换新键重投。
 - 等待超时不取消任务。使用原任务 ID 和游标继续 `wait/get/events`。
 - `uncertain` 表示无法确认原始执行结果，会保留容量；恢复只核对精确的持久化 Turn，不自动重放。
 - 返工保留任务、会话、目录和历史；验收需要独立证据，不能只转述 Codex 的完成声明。
 - 结果文件保存在本机，不自动上传、托管网页或变成豆包附件。
 - 不保证会话出现在 Codex 桌面侧栏，也不会自动唤醒已经结束的豆包对话。可回到豆包查询原任务。
-- 机器休眠、关机期间没有执行保证。
+- 需要电脑开机且用户已登录、服务可运行、账号与网络可用；不保证永不中断，休眠和关机期间不执行或恢复监督。
 
 网关检查 `allowedRoots` 与产物路径，并使用 Codex `workspace-write`、`approvalPolicy: never`。额外审批不会被自动放行。允许目录检查不是底层工具的完整读取隔离；此项目不提供多租户安全沙箱。
+
+MCP 客户端在每次 RPC 前重新读取 `connection.json` 和私有令牌。服务重启产生新令牌后，不需要把令牌复制到豆包；重启期间失败的调用也不会自动重投。连接恢复后先查原任务，需要时调用 `codex_recover` 核对原 Turn。“连接可恢复”不等于“原任务已恢复执行”。
+
+## 图片任务的原图保底
+
+图片生成记录独立保存在任务的 `images[]` 中；没有最终报告或 `result=null` 不代表没有生成图片。已完成的本地原图会复制到工作区 `.doubao-codex/artifacts/<task>/attempt-<n>/`，保留真实格式和原文件，记录文件大小、SHA-256 与 MIME 类型。
+
+图片事件、执行结束和恢复核对会尝试完成保底复制。任务失败或取消后，仍可查询原图记录，并使用 `codex_collect_images {id}` 收集精确 Thread/Turn 中已缓存的原图；此操作不启动或恢复模型、不重新生成、不改变任务执行或验收状态。
+
+保底复制不自动转换为 JPG，也不把 partial/未完成图片当作完成品。最终仍按用户要求的格式、尺寸、数量、命名与内容独立验收，只有 `completed` 任务可被接受。图片任务应为生成、格式处理和验证留出合理期限；默认任务期限为 7,200 秒（120 分钟），用户预算优先，不因超时自动重试或绕过期限。
+
+每任务跨全部返工最多记录 100 个图片项，达到上限会返回 `imageCollectionWarning`，新增图片项不再复制。图片校验限于文件头/容器，不是完整像素或内容验收，也不承诺抵御敌对本地进程的所有并发文件替换。详见 [工具说明](docs/tools.md) 和 [安全边界](docs/architecture.md#权限范围)。
+
+读取或恢复含多张图片的历史会话时，传输层流式省略 `imageGeneration.result` 的内联图像数据，保留完整 Thread/Turn 结构、标识、文字、`savedPath` 和失败信息。它不删除历史、原图或轮次，也不通过只读取最新 Turn 绕开恢复核对。非媒体数据仍有大小限制，异常协议会明确报错；连接健康不代表历史读取或派工一定成功。这项修复不改变 MCP 工具和 Skill，具体行为见 [大图片历史排障](docs/troubleshooting.md#历史图片较多时读取恢复或派工断连)。
 
 ## 维护
 
@@ -140,9 +167,9 @@ node src/cli.mjs call wait '{"id":"TASK_ID","timeoutSeconds":45}'
 node src/cli.mjs uninstall
 ```
 
-CLI 方法名是对应 MCP 名称去掉 `codex_`，详见 [13 个工具的接口说明](docs/tools.md)。服务日志位于状态目录的 `service.log` 和 `service.error.log`。
+CLI 方法名是对应 MCP 名称去掉 `codex_`，详见 [14 个工具的接口说明](docs/tools.md)。服务日志位于状态目录的 `service.log` 和 `service.error.log`。
 
-更新源码不会自动更新已部署服务。在没有排队、执行中或未知状态任务时，更新依赖并测试，再 `uninstall`、`install`。旧部署、数据库、配置、产物和停用的服务文件备份会保留。重新运行 `connector-config` 并更新豆包连接器参数。
+更新源码不会自动更新已部署服务。在没有排队、执行中或未知状态任务时，更新依赖并测试，再 `uninstall`、`install`。旧部署、数据库、配置、产物和停用的服务文件备份会保留。已经使用固定入口且 Node/状态目录未改变时，豆包参数无需随部署时间戳变化；若 MCP 工具或适配器变化，则重新连接 MCP、刷新工具；仅在 Skill 内容变化时重新导入对应 Skill。首次迁移旧入口时用 `connector-config` 更新一次参数。
 
 更多说明：[架构](docs/architecture.md) · [排障](docs/troubleshooting.md) · [验证记录](docs/verification.md) · [发布检查](docs/release-checklist.md)。
 

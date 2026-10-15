@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { pathToFileURL } from 'node:url';
 import { GatewayClient } from './client.mjs';
 
-const id = z.string().min(1).max(256).describe('Persistent gateway task ID.');
+const id = z.string().min(1).max(256).refine((value) => value.trim().length > 0, 'Task ID must not be blank.').describe('Persistent gateway task ID.');
 const workspace = z.string().min(1).max(4096).describe('Absolute local project directory, within the gateway workspace allowlist.');
 const key = z.string().min(1).max(200).describe('Stable unique key for this intended action. Reuse only for the exact same request; never create a new key to retry after a timeout.');
 const after = z.number().int().nonnegative().optional().describe('Last event cursor already received.');
@@ -43,7 +43,11 @@ const definitions = [
   },
   {
     name: 'codex_get', method: 'get', readOnly: true, schema: { id },
-    description: 'Read durable task state, result, thread, and evidence. Completed means execution ended; accepted means the supervisor verified it.',
+    description: 'Read durable task state, result, thread, evidence, and images, including partial image outputs from failed or cancelled tasks. Image availability does not mean the requested format, filename, or task is complete. Completed means execution ended; review=accepted means the supervisor verified it.',
+  },
+  {
+    name: 'codex_collect_images', method: 'collect_images', idempotent: true, destructive: false, schema: { id },
+    description: 'Inspect image metadata from this task’s exact recorded Codex turn and preserve existing local original images in its original workspace. Returns the full task with images, including partial outputs from failed or cancelled tasks. This idempotent operation writes local copies but never generates images, submits or resumes a turn, changes execution status, or accepts a result. Collected originals do not establish that the requested format or filename has been delivered.',
   },
   {
     name: 'codex_list', method: 'list', readOnly: true,
@@ -98,7 +102,7 @@ export function createMcpServer({ client = new GatewayClient() } = {}) {
       inputSchema: definition.schema,
       annotations: {
         readOnlyHint: Boolean(definition.readOnly),
-        destructiveHint: !definition.readOnly,
+        destructiveHint: definition.destructive ?? !definition.readOnly,
         idempotentHint: Boolean(definition.readOnly || definition.idempotent),
         openWorldHint: !definition.readOnly,
       },

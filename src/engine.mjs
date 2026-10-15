@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { GatewayError, inside, workspaceFor } from './config.mjs';
+import { captureImage } from './images.mjs';
 
 const terminal = new Set(['completed', 'failed', 'blocked', 'cancelled']);
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const now = () => new Date().toISOString();
+const sameAttempt = (a,b) => a.attempt===b.attempt&&a.threadId===b.threadId&&a.turnId===b.turnId&&a.blockingTurnId===b.blockingTurnId;
 const REPORT_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -31,8 +33,9 @@ export function verifiedArtifact(workspace, value) {
 }
 
 export class Engine {
-  constructor({store, client, config}) {
+  constructor({store, client, config, imageCacheRoot}) {
     this.store = store; this.client = client; this.config = config;
+    this.imageCacheRoot = imageCacheRoot;
     this.pumping = false; this.closing = false; this.bindingLocks = new Map();
     // Codex does not persist a rollout until the first turn. A just-created
     // thread is already loaded in this app-server and cannot yet be resumed.
@@ -49,7 +52,73 @@ export class Engine {
     });
     client.on('serverRequest', request => this.serverRequest(request));
   }
-  get(id) { const run = this.store.get(id); return {...run,cursor:this.store.cursor(id)}; }
+  get(id) { const run = this.store.get(id); return {...run,images:run.images||[],cursor:this.store.cursor(id)}; }
+  recordImage(run, item, turnId) {
+    // Image payloads can contain megabytes of base64. Persist only bounded
+    // metadata and a verified local copy, independently of the final report.
+    if(item?.type!=='imageGeneration'||!turnId||!item.id)return this.store.get(run.id);
+    const current=this.store.get(run.id);
+    if(!sameAttempt(run,current))return current;
+    run=current;
+    if(run.turnId&&run.turnId!==turnId)return run;
+    const images=[...(run.images||[])];
+    const index=images.findIndex(image=>image.itemId===item.id&&image.turnId===turnId&&image.attempt===run.attempt);
+    if(index<0&&images.length>=100) {
+      if(run.imageCollectionWarning)return run;
+      const imageCollectionWarning={code:'IMAGE_RECORD_LIMIT',message:'The 100-image record limit for this task has been reached. Additional originals were not copied; inspect the original Codex session.'};
+      return this.store.save({...run,imageCollectionWarning},'image_warning',imageCollectionWarning);
+    }
+    let image;
+    try {
+      workspaceFor(this.config,run.workspace);
+      image=captureImage({run,item,turnId,cacheRoot:this.imageCacheRoot});
+      // Codex may later evict its cache. Keep an already verified workspace
+      // copy discoverable, but recheck its bytes and path before trusting it.
+      const previous=index>=0?images[index]:null;
+      if(!image.artifact&&image.status==='completed'&&previous?.artifact) {
+        const retained=captureImage({run,item:{...item,savedPath:previous.artifact.path},turnId,cacheRoot:this.imageCacheRoot});
+        if(retained.artifact?.sha256===previous.artifact.sha256)image={...retained,savedPath:previous.savedPath};
+      }
+    } catch(error) {
+      // A missing/invalid image destination must never prevent a confirmed
+      // interruption or final turn state from being durably recorded.
+      image={itemId:String(item.id).slice(0,200),threadId:run.threadId,turnId,attempt:run.attempt,
+        status:String(item.status||'unknown').slice(0,40),savedPath:null,artifact:null,
+        delivery:{status:'failed',error:{code:'IMAGE_CAPTURE_FAILED',message:'Unable to safely capture this image in the task workspace.'}}};
+    }
+    if(index>=0&&JSON.stringify(images[index])===JSON.stringify(image))return run;
+    if(index<0)images.push(image);else images[index]=image;
+    return this.store.save({...run,images},'image',image);
+  }
+  captureTurnImages(run, turn) {
+    for(const item of turn.items||[]) {
+      if(item.type==='imageGeneration')run=this.recordImage(run,item,turn.id);
+    }
+    return run;
+  }
+  retryPendingImages(run) {
+    for(const image of run.images||[]) {
+      if(image.attempt===run.attempt&&image.turnId===run.turnId&&image.delivery?.status==='pending') {
+        run=this.recordImage(run,{type:'imageGeneration',id:image.itemId,status:image.status,savedPath:image.savedPath,failure:image.failure},image.turnId);
+      }
+    }
+    return run;
+  }
+  async collectImages({id}) {
+    const run=this.store.get(text(id,'id',256));
+    workspaceFor(this.config,run.workspace);
+    if(!run.turnId||run.blockingTurnId)throw new GatewayError('TURN_UNCONFIRMED','No owned, exact task turn is available for image collection. No work was started.');
+    // Never resume, replay, or regenerate. This also works for cancelled tasks
+    // whose final JSON report was never produced by the model.
+    const response=await this.client.request('thread/read',{threadId:run.threadId,includeTurns:true});
+    if(response.thread?.id!==run.threadId||fs.realpathSync(response.thread.cwd)!==run.workspace)throw new GatewayError('THREAD_WORKSPACE_MISMATCH','Stored thread does not match the task workspace.');
+    const turn=response.thread.turns?.find(turn=>turn.id===run.turnId);
+    if(!turn)throw new GatewayError('TURN_UNCONFIRMED','The exact submitted turn could not be found. No image paths were guessed.');
+    const current=this.store.get(run.id);
+    if(current.attempt!==run.attempt||current.threadId!==run.threadId||current.turnId!==run.turnId)throw new GatewayError('STALE_ATTEMPT','Task attempt changed during collection. Query its current state before collecting again.');
+    this.retryPendingImages(this.captureTurnImages(current,turn));
+    return this.get(run.id);
+  }
   list(limit = 20) { return this.store.all().reverse().slice(0,Math.max(1,Math.min(100,Number(limit)||20))).map(run => ({id:run.id,workspace:run.workspace,task:run.task.slice(0,300),status:run.status,review:run.review,attempt:run.attempt,threadId:run.threadId,turnId:run.turnId,holdsCapacity:run.holdsCapacity,updatedAt:run.updatedAt})); }
   async models() {
     const models=[]; let cursor;
@@ -98,7 +167,9 @@ export class Engine {
     if (!Array.isArray(constraints)||constraints.length>40||constraints.some(value=>typeof value!=='string'||value.length>4000)) throw new GatewayError('INVALID_INPUT','Invalid constraints.');
     const output=input.output||'text';
     if (!['text','json','artifacts'].includes(output)) throw new GatewayError('INVALID_INPUT','Invalid output format.');
-    const timeoutSeconds=input.timeoutSeconds??1800;
+    // Two hours gives image generation, post-processing, and delivery checks room to finish.
+    // Callers may still explicitly request any validated duration.
+    const timeoutSeconds=input.timeoutSeconds??7200;
     if (!Number.isInteger(timeoutSeconds)||timeoutSeconds<10||timeoutSeconds>86400) throw new GatewayError('INVALID_INPUT','timeoutSeconds must be 10–86400.');
     if(input.effort&&!['low','medium','high','xhigh'].includes(input.effort)) throw new GatewayError('INVALID_INPUT','Invalid effort.');
     if(input.model)text(input.model,'model',200);
@@ -107,12 +178,12 @@ export class Engine {
     const previous=this.store.byKey(`submit:${key}`,fingerprint);
     if (previous) return this.get(previous.id);
     const binding=await this.bindWorkspace({workspace});
-    const run={id:`dcg-${crypto.randomUUID()}`,...normalized,status:'queued',review:'pending',holdsCapacity:false,attempt:1,threadId:binding.threadId,turnId:null,result:null,error:null,history:[],createdAt:now(),updatedAt:now(),deadline:new Date(Date.now()+timeoutSeconds*1000).toISOString(),runtimeSource:'codex_app_server',usage:null};
+    const run={id:`dcg-${crypto.randomUUID()}`,...normalized,status:'queued',review:'pending',holdsCapacity:false,attempt:1,threadId:binding.threadId,turnId:null,result:null,error:null,images:[],history:[],createdAt:now(),updatedAt:now(),deadline:new Date(Date.now()+timeoutSeconds*1000).toISOString(),runtimeSource:'codex_app_server',usage:null};
     const persisted=this.store.create(run,`submit:${key}`,fingerprint);
     return this.get(persisted.id);
   }
   prompt(run) {
-    return `Execute this authorized task in the current workspace. Use your own tools to perform and verify it.\nGateway task ${run.id}, attempt ${run.attempt}.\nWorkspace: ${run.workspace}\nObjective: ${run.task}\nConstraints:\n${run.constraints.map(value=>`- ${value}`).join('\n')}\n${run.feedback?`Rework feedback (preserve existing useful work): ${run.feedback}\n`:''}Stay within the workspace and requested scope. If a permission, login or missing input prevents progress, report it honestly; do not change gateway configuration. Do not delegate back to this gateway.\nFinal response must be one JSON object, without markdown fences: {"status":"completed" or "blocked","text":"concise result and verification evidence","artifacts":["relative paths of actual deliverable files"],"data":null}. For output=json, data must be a STRING containing the JSON-encoded requested result; the gateway will parse it into structured data. Otherwise data is null. Include only actual files inside this workspace. Requested output: ${run.output}. A report of completion is subject to independent review.`;
+    return `Execute this authorized task in the current workspace. Use your own tools to perform and verify it.\nGateway task ${run.id}, attempt ${run.attempt}.\nWorkspace: ${run.workspace}\nObjective: ${run.task}\nConstraints:\n${run.constraints.map(value=>`- ${value}`).join('\n')}\n${run.feedback?`Rework feedback (preserve existing useful work): ${run.feedback}\n`:''}Stay within the workspace and requested scope. If a permission, login or missing input prevents progress, report it honestly; do not change gateway configuration. Do not delegate back to this gateway.\nFor image tasks, a successful generation is not delivery. Preserve each original, promptly copy or convert it into the requested workspace filename and actual format, and verify the file before proceeding. Never just rename PNG bytes to .jpg. The gateway separately keeps safe original-image copies under .doubao-codex/artifacts; these partial backups do not prove the requested deliverables are complete. Do not regenerate an existing image merely because a final report or conversion is missing. Respect the task deadline; do not extend it yourself.\nFinal response must be one JSON object, without markdown fences: {"status":"completed" or "blocked","text":"concise result and verification evidence","artifacts":["relative paths of actual deliverable files"],"data":null}. For output=json, data must be a STRING containing the JSON-encoded requested result; the gateway will parse it into structured data. Otherwise data is null. Include only actual files inside this workspace. Requested output: ${run.output}. A report of completion is subject to independent review.`;
   }
   async replaceUnstartedThread(run) {
     const binding=this.store.binding(run.workspace);
@@ -191,6 +262,7 @@ export class Engine {
     this.pumping=true;
     try {
       for(const run of this.store.all()) {
+        if(run.holdsCapacity)this.retryPendingImages(run);
         if(Date.parse(run.deadline)>Date.now())continue;
         if(run.status==='queued')this.store.save({...run,status:'failed',error:{code:'DEADLINE','message':'Task expired while queued; nothing was executed.'}});
         else if(run.holdsCapacity && !run.blockingTurnId && !['cancel_requested','uncertain'].includes(run.status))await this.cancel(run.id,'Task deadline reached.');
@@ -204,7 +276,10 @@ export class Engine {
     } finally { this.pumping=false; }
   }
   notification({method,params={}}) {
-    const run=this.store.all().find(run=>run.holdsCapacity && run.threadId===params.threadId);
+    const imageEvent=method==='item/completed'&&params.item?.type==='imageGeneration';
+    const runs=this.store.all();
+    const run=(imageEvent&&params.turnId?runs.find(run=>run.threadId===params.threadId&&run.turnId===params.turnId):null)
+      ||runs.find(run=>run.holdsCapacity && run.threadId===params.threadId);
     if(!run)return;
     // An external turn is not this task. Only explicit recovery can clear its
     // workspace reservation after checking that exact turn's persisted state.
@@ -217,7 +292,10 @@ export class Engine {
       this.store.save({...run,turnId:params.turn.id,status:run.status==='cancel_requested'?'cancel_requested':'running'});
     } else if(method==='item/completed') {
       const item=params.item;
-      if(item?.type==='agentMessage') {
+      if(item?.type==='imageGeneration') {
+        // Unlike text progress, image ownership must have an exact turn ID.
+        if(eventTurn)this.recordImage(run,item,eventTurn);
+      } else if(item?.type==='agentMessage') {
         this.store.save({...run,lastMessage:item.text,lastPhase:item.phase},'message',{text:item.text?.slice(0,12000),phase:item.phase,truncated:item.text?.length>12000});
       } else if(item) {
         this.store.event(run.id,'item',{type:item.type,id:item.id,status:item.status,exitCode:item.exitCode,command:item.type==='commandExecution'?item.command?.slice(0,1000):undefined});
@@ -227,7 +305,11 @@ export class Engine {
     else if(method==='thread/tokenUsage/updated') this.store.save({...run,usage:params.tokenUsage},'usage',params.tokenUsage);
   }
   finish(run,turn) {
+    const current=this.store.get(run.id);
+    if(!sameAttempt(run,current)||!current.holdsCapacity)return;
+    run=current;
     if(run.turnId&&run.turnId!==turn.id)return;
+    run=this.retryPendingImages(this.captureTurnImages(run,turn));
     const updated={...run,turnId:turn.id,holdsCapacity:false,finishedAt:now()};
     if(turn.status==='interrupted') { this.store.save({...updated,status:'cancelled',error:{code:'INTERRUPTED',message:'Codex confirmed interruption. Existing file changes are retained.'}}); return; }
     if(turn.status!=='completed') { this.store.save({...updated,status:'failed',error:{code:'CODEX_FAILED',message:turn.error?.message||`Turn ended with ${turn.status}`}});return; }
@@ -283,26 +365,39 @@ export class Engine {
     return this.store.save({...run,review:'accepted',evidence,checkedArtifacts:checked,acceptedAt:now()},'accepted',{evidence,artifacts:checked});
   }
   async reconcile(run) {
+    const currentRecovery=()=>{
+      const current=this.store.get(run.id);
+      return sameAttempt(run,current)&&current.holdsCapacity?current:null;
+    };
     try {
       const response=await this.client.request('thread/read',{threadId:run.threadId,includeTurns:true});
+      let current=currentRecovery();
+      if(!current)return this.get(run.id);
+      if(response.thread?.id!==run.threadId||fs.realpathSync(response.thread.cwd)!==run.workspace)throw new GatewayError('THREAD_WORKSPACE_MISMATCH','Stored thread does not match the task workspace.');
       const turns=response.thread.turns||[];
       if(run.blockingTurnId) {
         const blocking=turns.find(turn=>turn.id===run.blockingTurnId);
         if(blocking&&['completed','failed','interrupted'].includes(blocking.status)) {
-          this.store.save({...run,status:'blocked',holdsCapacity:false,blockingTurnId:null,error:{code:'EXTERNAL_TURN_ENDED',message:'The external turn ended. This task was never dispatched; use rework to authorize a new attempt.'}});
+          this.store.save({...current,status:'blocked',holdsCapacity:false,blockingTurnId:null,error:{code:'EXTERNAL_TURN_ENDED',message:'The external turn ended. This task was never dispatched; use rework to authorize a new attempt.'}});
         } else {
-          this.store.save({...run,status:'uncertain',holdsCapacity:true,error:{code:'EXTERNAL_TURN_UNCONFIRMED',message:'The exact external blocking turn is not confirmed finished. This task has not been submitted.'}});
+          this.store.save({...current,status:'uncertain',holdsCapacity:true,error:{code:'EXTERNAL_TURN_UNCONFIRMED',message:'The exact external blocking turn is not confirmed finished. This task has not been submitted.'}});
         }
         return this.get(run.id);
       }
       const turn=run.turnId?turns.find(turn=>turn.id===run.turnId):null;
       if(!turn)throw new Error('Cannot identify the exact submitted turn; no task was resubmitted.');
-      if(['completed','failed','interrupted'].includes(turn.status))this.finish(run,turn);
+      current=this.retryPendingImages(this.captureTurnImages(current,turn));
+      if(['completed','failed','interrupted'].includes(turn.status))this.finish(current,turn);
       else {
+        if(current.status==='cancel_requested')return this.get(run.id);
         await this.client.request('thread/resume',{threadId:run.threadId,cwd:run.workspace,approvalPolicy:'never',sandbox:'workspace-write'});
-        this.store.save({...run,status:'uncertain',error:{code:'TURN_UNCONFIRMED',message:'Saved turn is not confirmed finished. Inspect the original Codex session before further work.'}});
+        current=currentRecovery();
+        if(current&&current.status!=='cancel_requested')this.store.save({...current,status:'uncertain',error:{code:'TURN_UNCONFIRMED',message:'Saved turn is not confirmed finished. Inspect the original Codex session before further work.'}});
       }
-    } catch(error) {this.store.save({...run,status:'uncertain',holdsCapacity:true,error:{code:'RECOVERY_UNCERTAIN',message:error.message}});}
+    } catch(error) {
+      const current=currentRecovery();
+      if(current&&current.status!=='cancel_requested')this.store.save({...current,status:'uncertain',holdsCapacity:true,error:{code:'RECOVERY_UNCERTAIN',message:error.message}});
+    }
     return this.get(run.id);
   }
   async restore() { for(const run of this.store.all().filter(run=>run.holdsCapacity))await this.reconcile(run); }

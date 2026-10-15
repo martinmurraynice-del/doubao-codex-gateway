@@ -8,12 +8,12 @@ const gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {cwd: root
 if (fs.realpathSync(gitRoot) !== fs.realpathSync(root)) {
   throw new Error('Run release checks in the standalone gateway Git repository, not its parent.');
 }
-const files = execFileSync('git', ['ls-files', '-z'], {cwd: root, encoding: 'utf8'}).split('\0').filter(Boolean);
+const files = [...new Set(execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], {cwd: root, encoding: 'utf8'}).split('\0').filter(Boolean))];
 const required = ['README.md', 'LICENSE', 'config.example.json', 'package-lock.json',
   'skills/doubao-codex-executor/SKILL.md', 'docs/architecture.md', 'docs/tools.md',
   'docs/troubleshooting.md', 'docs/verification.md', 'docs/release-checklist.md'];
 const problems = required.filter(file => !files.includes(file)).map(file => `Missing tracked file: ${file}`);
-const privateFile = /(^|\/)(node_modules|data|dist|smoke-workspace)(\/|$)|(^|\/)(config\.local\.json|connection\.json|installation\.json|token|\.env(?:\..*)?)$|\.(?:sqlite(?:-\w+)?|db(?:-\w+)?|log|pem|key|zip)$/i;
+const privateFile = /(^|\/)(node_modules|data|dist|smoke-workspace|\.doubao-codex)(\/|$)|(^|\/)(config\.local\.json|connection\.json|installation\.json|token|\.env(?:\..*)?)$|\.(?:sqlite(?:-\w+)?|db(?:-\w+)?|log|pem|key|zip)$/i;
 const privateContent = [
   [/\/(?:Users|home)\/[a-zA-Z0-9_.-]+\//, 'machine-specific home path'],
   [/dcg-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i, 'real-looking task identifier'],
@@ -39,4 +39,4 @@ for (const file of files) {
   }
 }
 if (problems.length) throw new Error(`Release checks failed:\n${problems.join('\n')}`);
-console.log(`Release checks passed for ${files.length} tracked files (heuristic privacy and documentation checks; not a security audit).`);
+console.log(`Release checks passed for ${files.length} tracked/unignored files (heuristic privacy and documentation checks; not a security audit).`);

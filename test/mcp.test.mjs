@@ -108,7 +108,7 @@ test('MCP exposes all gateway tools, validates inputs and relays structured resu
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 13);
+  assert.equal(tools.length, 14);
   assert.equal(tools.find((tool) => tool.name === 'codex_wait').annotations.readOnlyHint, true);
   assert.equal(tools.find((tool) => tool.name === 'codex_submit').annotations.idempotentHint, true);
   const arguments_ = { workspace: '/tmp/example', task: 'Build A', idempotencyKey: 'mcp-one' };
@@ -121,4 +121,43 @@ test('MCP exposes all gateway tools, validates inputs and relays structured resu
   const notFound = await client.callTool({ name: 'codex_get', arguments: { id: 'missing' } });
   assert.equal(notFound.isError, true);
   assert.equal(notFound.structuredContent.error.code, 'NOT_FOUND');
+});
+
+test('MCP image collection validates task IDs and forwards partial image results unchanged', async (t) => {
+  const [{ createMcpServer }, { Client }, { InMemoryTransport }] = await Promise.all([
+    import('../src/mcp.mjs'),
+    import('@modelcontextprotocol/sdk/client/index.js'),
+    import('@modelcontextprotocol/sdk/inMemory.js'),
+  ]);
+  const calls = [];
+  const task = {
+    id: 'task-images', status: 'cancelled', review: 'pending', threadId: 'thread-original', turnId: 'turn-original',
+    images: [{ path: '/tmp/project/images/original.png', name: 'original.png', bytes: 68 }],
+    error: { code: 'INTERRUPTED', message: 'Task was interrupted after producing an image.' },
+  };
+  const server = createMcpServer({ client: { async call(method, params) {
+    calls.push({ method, params });
+    return task;
+  } } });
+  const client = new Client({ name: 'image-collection-test', version: '1.0.0' });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close(); await server.close(); });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const { tools } = await client.listTools();
+  const collect = tools.find((tool) => tool.name === 'codex_collect_images');
+  assert.equal(collect.annotations.readOnlyHint, false);
+  assert.equal(collect.annotations.idempotentHint, true);
+  assert.equal(collect.annotations.destructiveHint, false);
+  for (const args of [{}, { id: '' }, { id: '  ' }, { id: 123 }, { id: 'x'.repeat(257) }]) {
+    const invalid = await client.callTool({ name: 'codex_collect_images', arguments: args });
+    assert.equal(invalid.isError, true);
+  }
+  assert.equal(calls.length, 0);
+  const result = await client.callTool({ name: 'codex_collect_images', arguments: { id: task.id } });
+  assert.deepEqual(calls, [{ method: 'collect_images', params: { id: task.id } }]);
+  assert.deepEqual(result.structuredContent, { result: task });
+  assert.deepEqual(JSON.parse(result.content[0].text), { result: task });
+  assert.equal(result.structuredContent.result.status, 'cancelled');
+  assert.equal(result.structuredContent.result.review, 'pending');
 });

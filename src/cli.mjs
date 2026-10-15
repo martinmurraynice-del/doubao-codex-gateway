@@ -6,9 +6,11 @@ import {execFileSync} from 'node:child_process';
 import {parseArgs} from 'node:util';
 import {ROOT, STATE_DIR, CONFIG_FILE, loadConfig, validateConfig, GatewayError} from './config.mjs';
 import {GatewayClient} from './client.mjs';
+import {resolveInstalledMcp} from './installed-mcp.mjs';
 
 const DEFAULT_SERVICE_LABEL='io.github.doubao-codex-gateway';
 const INSTALLATION_FILE=path.join(path.dirname(STATE_DIR),'installation.json');
+const MCP_LAUNCHER=path.join(path.dirname(STATE_DIR),'bin','mcp.mjs');
 const argv=process.argv.slice(2);
 const command=argv.shift()||'help';
 const print=value=>console.log(JSON.stringify(value,null,2));
@@ -54,6 +56,27 @@ function privateState() {
   }
   fs.mkdirSync(STATE_DIR,{recursive:true,mode:0o700});fs.chmodSync(STATE_DIR,0o700);
 }
+function stableMcpReady() {
+  try {
+    const root=fs.realpathSync(path.dirname(STATE_DIR));
+    const actual=fs.realpathSync(MCP_LAUNCHER);
+    const relative=path.relative(root,actual);
+    return fs.lstatSync(MCP_LAUNCHER).isFile()&&!path.isAbsolute(relative)&&relative!== '..'&&!relative.startsWith(`..${path.sep}`);
+  } catch {return false;}
+}
+function installMcpLauncher() {
+  const bin=path.dirname(MCP_LAUNCHER);
+  fs.mkdirSync(bin,{recursive:true,mode:0o700});
+  if(fs.realpathSync(bin)!==path.join(fs.realpathSync(path.dirname(STATE_DIR)),'bin')) {
+    throw new GatewayError('INSTALLATION','The stable MCP directory must be inside this gateway installation.');
+  }
+  const temporary=path.join(bin,`.mcp-${process.pid}-${Date.now()}.tmp`);
+  try {
+    fs.copyFileSync(path.join(ROOT,'src','installed-mcp.mjs'),temporary,fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(temporary,0o600);fs.renameSync(temporary,MCP_LAUNCHER);
+  } finally {try {fs.unlinkSync(temporary);}catch(error){if(error.code!=='ENOENT')throw error;}}
+  return MCP_LAUNCHER;
+}
 async function main() {
   const commands=new Set(['help','--help','-h','init','serve','call','status','doctor','connector-config','paths','install','uninstall']);
   if(!commands.has(command))throw new GatewayError('INPUT',`Unknown command: ${command}. Run help for usage.`);
@@ -95,22 +118,25 @@ async function main() {
   }
   if(command==='connector-config') {
     const record=installation();
-    const runtime=record?.runtime||ROOT;
+    const installed=record?resolveInstalledMcp({stateDir:STATE_DIR}):null;
+    const runtime=installed?.runtime||ROOT;
     const installedSkill=path.join(runtime,'skills','doubao-codex-executor','SKILL.md');
     const source=typeof record?.source==='string'&&path.isAbsolute(record.source)?record.source:ROOT;
     const skill=fs.existsSync(installedSkill)?installedSkill:path.join(source,'skills','doubao-codex-executor','SKILL.md');
-    print({name:'Doubao Codex Gateway',transport:'STDIO',command:record?.nodeBin||process.execPath,args:[path.join(runtime,'src','mcp.mjs')],env:{GATEWAY_STATE_DIR:STATE_DIR},skill});return;
+    const entrypoint=installed&&stableMcpReady()?MCP_LAUNCHER:installed?.mcpPath||path.join(ROOT,'src','mcp.mjs');
+    print({name:'Doubao Codex Gateway',transport:'STDIO',command:record?.nodeBin||process.execPath,args:[entrypoint],env:{GATEWAY_STATE_DIR:STATE_DIR},skill});return;
   }
   if(command==='paths') {
     const record=installation();
     const paths=servicePaths(record);
-    print({source:ROOT,stateDir:STATE_DIR,configFile:CONFIG_FILE,installationFile:INSTALLATION_FILE,runtime:record?.runtime||ROOT,nodeBin:record?.nodeBin||process.execPath,serviceLabel:paths.label,launchAgentPlist:process.platform==='darwin'?paths.plist:null});return;
+    const stable=Boolean(record)&&stableMcpReady();
+    print({source:ROOT,stateDir:STATE_DIR,configFile:CONFIG_FILE,installationFile:INSTALLATION_FILE,runtime:record?.runtime||ROOT,nodeBin:record?.nodeBin||process.execPath,mcpLauncher:MCP_LAUNCHER,stableMcpReady:stable,mcpEntrypoint:stable?MCP_LAUNCHER:path.join(record?.runtime||ROOT,'src','mcp.mjs'),serviceLabel:paths.label,launchAgentPlist:process.platform==='darwin'?paths.plist:null});return;
   }
   if(command==='install') {
     if(process.platform!=='darwin')throw new GatewayError('PLATFORM','LaunchAgent installation is macOS-only. Run serve under your service manager.');
     const {label,service,plist}=servicePaths();
     loadConfig();
-    if(registered(service)){const health=await new GatewayClient().call('health',{}, {timeoutMs:5000});print({installed:true,alreadyRunning:true,service,health});return;}
+    if(registered(service)){const health=await new GatewayClient().call('health',{}, {timeoutMs:5000});resolveInstalledMcp({stateDir:STATE_DIR});const mcpLauncher=installMcpLauncher();print({installed:true,alreadyRunning:true,service,mcpLauncher,health});return;}
     try {await new GatewayClient().call('health',{}, {timeoutMs:1000});throw new GatewayError('ALREADY_RUNNING','Stop the foreground gateway before installing its LaunchAgent.');}
     catch(error){if(error.code==='ALREADY_RUNNING')throw error;}
     privateState();fs.mkdirSync(path.dirname(plist),{recursive:true});
@@ -120,14 +146,19 @@ async function main() {
     const runtime=path.join(path.dirname(STATE_DIR),'deployments',`${Date.now()}`);
     fs.mkdirSync(runtime,{recursive:true,mode:0o700});
     for(const name of ['src','skills','node_modules','package.json','package-lock.json'])fs.cpSync(path.join(ROOT,name),path.join(runtime,name),{recursive:true,errorOnExist:true,force:false});
-    fs.writeFileSync(INSTALLATION_FILE,JSON.stringify({runtime,source:ROOT,nodeBin:process.execPath,serviceLabel:label,installedAt:new Date().toISOString()},null,2),{mode:0o600});
+    const manifestTemporary=`${INSTALLATION_FILE}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(manifestTemporary,JSON.stringify({runtime,source:ROOT,nodeBin:process.execPath,serviceLabel:label,installedAt:new Date().toISOString()},null,2),{mode:0o600,flag:'wx'});
+      fs.renameSync(manifestTemporary,INSTALLATION_FILE);
+    } finally {try{fs.unlinkSync(manifestTemporary);}catch(error){if(error.code!=='ENOENT')throw error;}}
+    const mcpLauncher=installMcpLauncher();
     for(const file of ['service.log','service.error.log'])fs.closeSync(fs.openSync(path.join(STATE_DIR,file),'a',0o600));
     const env={PATH:process.env.PATH||'/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',GATEWAY_STATE_DIR:STATE_DIR,GATEWAY_CONFIG:CONFIG_FILE};
     const document=`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(path.join(runtime,'src','cli.mjs'))}</string><string>serve</string></array><key>WorkingDirectory</key><string>${xml(runtime)}</string><key>EnvironmentVariables</key><dict>${Object.entries(env).map(([key,value])=>`<key>${key}</key><string>${xml(value)}</string>`).join('')}</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer><key>StandardOutPath</key><string>${xml(path.join(STATE_DIR,'service.log'))}</string><key>StandardErrorPath</key><string>${xml(path.join(STATE_DIR,'service.error.log'))}</string></dict></plist>\n`;
     fs.writeFileSync(plist,document,{mode:0o600,flag:'wx'});
     execFileSync('launchctl',['bootstrap',`gui/${os.userInfo().uid}`,plist],{stdio:'inherit'});
     for(let attempt=0;attempt<40;attempt++) {
-      try {const health=await new GatewayClient().call('health',{}, {timeoutMs:1000});print({installed:true,service,plist,health});return;}catch{}
+      try {const health=await new GatewayClient().call('health',{}, {timeoutMs:1000});print({installed:true,service,plist,mcpLauncher,health});return;}catch{}
       await new Promise(resolve=>setTimeout(resolve,500));
     }
     throw new GatewayError('STARTUP',`Service was registered but is not healthy yet. Inspect ${path.join(STATE_DIR,'service.error.log')}.`);

@@ -18,3 +18,4 @@ token
 *.pem
 *.key
 coverage/
+.doubao-codex/
